@@ -1,0 +1,31 @@
+import asyncio
+import logging
+import os
+from dotenv import load_dotenv
+
+from .config import load_settings
+from .monitor import Monitor
+
+
+def setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def main() -> None:
+    load_dotenv()
+    setup_logging()
+    settings = load_settings()
+
+    if settings.api_id == 0 or not settings.api_hash:
+        logging.error("API_ID/API_HASH are required. Set them in environment or .env")
+        return
+
+    if not settings.monitored_groups:
+        logging.warning("MONITORED_GROUPS is empty. Set a comma-separated list in .env")
+
+    monitor = Monitor(settings)
+    asyncio.run(monitor.start())
+
+
+if __name__ == "__main__":
+    main()
