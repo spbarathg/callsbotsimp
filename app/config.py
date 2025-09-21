@@ -22,6 +22,7 @@ class Settings:
     fast_ttl_seconds: int
     rc_timeout_ms: int
     monitored_groups: List[str]
+    db_path: str
 
 
 def load_settings() -> Settings:
@@ -30,6 +31,7 @@ def load_settings() -> Settings:
     session = os.getenv("SESSION", "memecoin_session")
     data_dir = os.getenv("DATA_DIR", "data")
     session_path = os.path.join(data_dir, session)
+    db_path = os.path.join(data_dir, os.getenv("DB_FILE", "signals.db"))
     target_group = os.getenv("TARGET_GROUP", "@callbotmemecoin")
     hot_threshold = int(os.getenv("HOT_THRESHOLD", "4"))
     hot_ttl_seconds = int(os.getenv("HOT_TTL_SECONDS", "43200"))  # 12h
@@ -49,4 +51,5 @@ def load_settings() -> Settings:
         fast_ttl_seconds=fast_ttl_seconds,
         rc_timeout_ms=rc_timeout_ms,
         monitored_groups=monitored_groups,
+        db_path=db_path,
     )
