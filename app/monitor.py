@@ -10,7 +10,7 @@ from .parser import extract_solana_addresses
 from .tracker import HotTracker
 from .rugcheck import RugcheckClient
 from .recorder import SignalRecorder
-from .events import SignalEvent, RugcheckEvent
+from .events import SignalEvent, RugcheckEvent, MentionEvent, TradeIntentEvent
 
 
 class Monitor:
@@ -25,6 +25,11 @@ class Monitor:
         # In-process queues so recording never blocks Telegram handler
         self._signal_queue: asyncio.Queue[SignalEvent] = asyncio.Queue()
         self._rc_queue: asyncio.Queue[RugcheckEvent] = asyncio.Queue()
+        self._mention_queue: asyncio.Queue[MentionEvent] = asyncio.Queue()
+        self._intent_queue: asyncio.Queue[TradeIntentEvent] = asyncio.Queue()
+        # Coalesce duplicate fast/slow alerts for the same CA within this window (seconds)
+        self._coalesce_seconds: int = 3600
+        self._any_alerted_at: dict[str, float] = {}
 
     async def start(self) -> None:
         logging.info("🚀 Starting Telegram client…")
@@ -36,6 +41,9 @@ class Monitor:
         consumers = [
             asyncio.create_task(self._consume_signals()),
             asyncio.create_task(self._consume_rugcheck()),
+            asyncio.create_task(self._consume_mentions()),
+            asyncio.create_task(self._consume_intents()),
+            asyncio.create_task(self._maintenance_task()),
         ]
         try:
             await self.client.run_until_disconnected()
@@ -44,27 +52,33 @@ class Monitor:
                 c.cancel()
             await self.rugcheck.close()
 
-    def _format_rc(self, ca: str, report: dict | None) -> str:
-        if not report:
-            return "RC: pending"
-        score, risk_text, lp_text, upd_short = RugcheckClient.summarize(report)
-        return f"RC: score {score} | risks: {risk_text} | LP {lp_text} | updAuth {upd_short}"
+    async def _maintenance_task(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(300)
+                self.tracker_fast.clear_expired()
+                self.tracker_slow.clear_expired()
+                # prune coalescing map
+                now = time.time()
+                for ca, ts in list(self._any_alerted_at.items()):
+                    if now - ts > max(self._coalesce_seconds, self.settings.hot_ttl_seconds):
+                        self._any_alerted_at.pop(ca, None)
+        except asyncio.CancelledError:
+            return
 
-    def _signal_message_fast(self, ca: str, rc_tail: str | None = None) -> str:
-        base = f"⚡ {self.settings.hot_threshold}x — {ca}"
-        return f"{base} | {rc_tail}" if rc_tail else base
+    def _signal_message_fast(self, ca: str) -> str:
+        return f"⚡ {self.settings.hot_threshold}x — {ca}"
 
-    def _signal_message_slow(self, ca: str, rc_tail: str | None = None) -> str:
-        base = f"🔥 {self.settings.hot_threshold}x — {ca}"
-        return f"{base} | {rc_tail}" if rc_tail else base
+    def _signal_message_slow(self, ca: str) -> str:
+        return f"🔥 {self.settings.hot_threshold}x — {ca}"
 
     async def _append_rc_and_edit(self, message, ca: str) -> None:
         try:
             report = await self.rugcheck.fetch_report(ca)
-            rc_tail = self._format_rc(ca, report)
+            score, risk_text, lp_text, upd_short = RugcheckClient.summarize(report or {})
+            rc_tail = f"RC: score {score} | risks: {risk_text} | LP {lp_text} | updAuth {upd_short}"
             await message.edit(f"{message.raw_text} | {rc_tail}")
             # Record summarized RC
-            score, risk_text, lp_text, upd_short = RugcheckClient.summarize(report or {})
             await self._rc_queue.put(
                 RugcheckEvent(
                     ts=int(time.time()),
@@ -77,6 +91,49 @@ class Monitor:
             )
         except Exception:
             pass
+
+    async def _send_signal_and_snapshot(self, *, kind: str, ca: str, ug_fast: int, ug_slow: int, tracker: HotTracker, group_id: int, group_name: str | None) -> None:
+        if kind == "fast":
+            msg_text = self._signal_message_fast(ca)
+        else:
+            msg_text = self._signal_message_slow(ca)
+        sent = await self.client.send_message(self.settings.target_group, msg_text)
+        logging.info("📣 %s signal sent" % ("Fast" if kind == "fast" else "Signal"))
+        await self._signal_queue.put(
+            SignalEvent(
+                ts=int(time.time()),
+                ca=ca,
+                group_id=group_id,
+                group_name=group_name,
+                kind=kind,
+                ug_fast=ug_fast,
+                ug_slow=ug_slow,
+                hot_threshold=self.settings.hot_threshold,
+                sent_message_id=getattr(sent, "id", None),
+                extra=None,
+            )
+        )
+        asyncio.create_task(self._append_rc_and_edit(sent, ca))
+        vel = tracker.get_velocity_mpm(ca)
+        first_ts, last_ts = tracker.get_first_last_seen(ca)
+        await self._intent_queue.put(
+            TradeIntentEvent(
+                ts=int(time.time()),
+                ca=ca,
+                kind=kind,
+                ug_fast=ug_fast,
+                ug_slow=ug_slow,
+                velocity_mpm=vel,
+                first_seen_ts=first_ts,
+                last_seen_ts=last_ts,
+                rc_score="pending",
+                rc_risk_text="pending",
+                rc_lp_text="pending",
+                rc_upd_short="pending",
+            )
+        )
+        # Mark as alerted for coalescing
+        self._any_alerted_at[ca] = time.time()
 
     async def _consume_signals(self) -> None:
         while True:
@@ -116,6 +173,45 @@ class Monitor:
             finally:
                 self._rc_queue.task_done()
 
+    async def _consume_mentions(self) -> None:
+        while True:
+            ev = await self._mention_queue.get()
+            try:
+                await self.recorder.record_mention(
+                    ts=ev.ts,
+                    ca=ev.ca,
+                    group_id=ev.group_id,
+                    group_name=ev.group_name,
+                    message_id=ev.message_id,
+                )
+            except Exception as exc:
+                logging.exception(f"record_mention failed: {exc}")
+            finally:
+                self._mention_queue.task_done()
+
+    async def _consume_intents(self) -> None:
+        while True:
+            ev = await self._intent_queue.get()
+            try:
+                await self.recorder.record_trade_intent(
+                    ts=ev.ts,
+                    ca=ev.ca,
+                    kind=ev.kind,
+                    ug_fast=ev.ug_fast,
+                    ug_slow=ev.ug_slow,
+                    velocity_mpm=ev.velocity_mpm,
+                    first_seen_ts=ev.first_seen_ts,
+                    last_seen_ts=ev.last_seen_ts,
+                    rc_score=ev.rc_score,
+                    rc_risk_text=ev.rc_risk_text,
+                    rc_lp_text=ev.rc_lp_text,
+                    rc_upd_short=ev.rc_upd_short,
+                )
+            except Exception as exc:
+                logging.exception(f"record_trade_intent failed: {exc}")
+            finally:
+                self._intent_queue.task_done()
+
     async def _on_message(self, event) -> None:
         try:
             chat = await event.get_chat()
@@ -147,48 +243,44 @@ class Monitor:
 
                 ug_fast = self.tracker_fast.add_hit(ca, group_id)
                 ug_slow = self.tracker_slow.add_hit(ca, group_id)
+                # persist mention for auto-trade analytics
+                await self._mention_queue.put(
+                    MentionEvent(
+                        ts=int(time.time()),
+                        ca=ca,
+                        group_id=group_id,
+                        group_name=group_name,
+                        message_id=getattr(event.message, "id", None),
+                    )
+                )
                 logging.info(f"👀 {group_name} → {ca} (fast {ug_fast}/{self.settings.hot_threshold}, slow {ug_slow}/{self.settings.hot_threshold})")
 
                 if self.tracker_fast.should_alert(ca, self.settings.hot_threshold):
-                    msg = self._signal_message_fast(ca)
-                    sent = await self.client.send_message(self.settings.target_group, msg)
-                    logging.info("📣 Fast signal sent")
-                    # Enqueue signal for persistence
-                    await self._signal_queue.put(
-                        SignalEvent(
-                            ts=int(time.time()),
-                            ca=ca,
-                            group_id=group_id,
-                            group_name=group_name,
-                            kind="fast",
-                            ug_fast=ug_fast,
-                            ug_slow=ug_slow,
-                            hot_threshold=self.settings.hot_threshold,
-                            sent_message_id=getattr(sent, "id", None),
-                            extra=None,
-                        )
+                    await self._send_signal_and_snapshot(
+                        kind="fast",
+                        ca=ca,
+                        ug_fast=ug_fast,
+                        ug_slow=ug_slow,
+                        tracker=self.tracker_fast,
+                        group_id=group_id,
+                        group_name=group_name,
                     )
-                    asyncio.create_task(self._append_rc_and_edit(sent, ca))
 
-                if self.tracker_slow.should_alert(ca, self.settings.hot_threshold):
-                    msg = self._signal_message_slow(ca)
-                    sent = await self.client.send_message(self.settings.target_group, msg)
-                    logging.info("📣 Signal sent")
-                    await self._signal_queue.put(
-                        SignalEvent(
-                            ts=int(time.time()),
-                            ca=ca,
-                            group_id=group_id,
-                            group_name=group_name,
-                            kind="slow",
-                            ug_fast=ug_fast,
-                            ug_slow=ug_slow,
-                            hot_threshold=self.settings.hot_threshold,
-                            sent_message_id=getattr(sent, "id", None),
-                            extra=None,
-                        )
+                # Suppress slow alert if a fast/slow alert for same CA was sent recently
+                last_any = self._any_alerted_at.get(ca)
+                coalesce_ok = True
+                if last_any is not None and time.time() - last_any < self._coalesce_seconds:
+                    coalesce_ok = False
+                if coalesce_ok and self.tracker_slow.should_alert(ca, self.settings.hot_threshold):
+                    await self._send_signal_and_snapshot(
+                        kind="slow",
+                        ca=ca,
+                        ug_fast=ug_fast,
+                        ug_slow=ug_slow,
+                        tracker=self.tracker_slow,
+                        group_id=group_id,
+                        group_name=group_name,
                     )
-                    asyncio.create_task(self._append_rc_and_edit(sent, ca))
 
         except Exception as exc:
             logging.exception(f"Handler error: {exc}")

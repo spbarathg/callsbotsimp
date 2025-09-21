@@ -34,9 +34,6 @@ def _normalize_candidate(token: str) -> str:
     # Standard 32-byte mint as-is
     if _is_valid_solana(t):
         return t
-    # Fallback: trim trailing 'pump' if present and validate
-    if t.endswith("pump") and _is_valid_solana(t[:-4]):
-        return t[:-4]
     return ""
 
 

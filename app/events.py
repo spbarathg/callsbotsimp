@@ -26,3 +26,27 @@ class RugcheckEvent:
     upd_short: str
 
 
+
+@dataclass
+class MentionEvent:
+    ts: int
+    ca: str
+    group_id: int
+    group_name: Optional[str]
+    message_id: Optional[int]
+
+
+@dataclass
+class TradeIntentEvent:
+    ts: int
+    ca: str
+    kind: str  # "fast" | "slow"
+    ug_fast: Optional[int]
+    ug_slow: Optional[int]
+    velocity_mpm: float
+    first_seen_ts: Optional[int]
+    last_seen_ts: Optional[int]
+    rc_score: str
+    rc_risk_text: str
+    rc_lp_text: str
+    rc_upd_short: str

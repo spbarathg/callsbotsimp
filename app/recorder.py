@@ -46,6 +46,43 @@ class SignalRecorder:
                     )
                     """
                 )
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mentions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts INTEGER NOT NULL,
+                        ca TEXT NOT NULL,
+                        group_id INTEGER NOT NULL,
+                        group_name TEXT,
+                        message_id INTEGER
+                    )
+                    """
+                )
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS trade_intents (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts INTEGER NOT NULL,
+                        ca TEXT NOT NULL,
+                        kind TEXT NOT NULL, -- fast|slow
+                        ug_fast INTEGER,
+                        ug_slow INTEGER,
+                        velocity_mpm REAL,
+                        first_seen_ts INTEGER,
+                        last_seen_ts INTEGER,
+                        rc_score TEXT,
+                        rc_risk_text TEXT,
+                        rc_lp_text TEXT,
+                        rc_upd_short TEXT
+                    )
+                    """
+                )
+                # Indexes for efficiency
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_signals_ca ON signals(ca)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_mentions_ca_ts ON mentions(ca, ts)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_intents_ts ON trade_intents(ts)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_intents_ca ON trade_intents(ca)")
                 await db.commit()
             self._initialized = True
 
@@ -96,6 +133,59 @@ class SignalRecorder:
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (ts, ca, score, risk_text, lp_text, upd_short),
+            )
+            await db.commit()
+
+    async def record_mention(self, *, ts: int, ca: str, group_id: int, group_name: str | None, message_id: int | None) -> None:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO mentions (ts, ca, group_id, group_name, message_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (ts, ca, group_id, group_name, message_id),
+            )
+            await db.commit()
+
+    async def record_trade_intent(
+        self,
+        *,
+        ts: int,
+        ca: str,
+        kind: str,
+        ug_fast: int | None,
+        ug_slow: int | None,
+        velocity_mpm: float,
+        first_seen_ts: int | None,
+        last_seen_ts: int | None,
+        rc_score: str,
+        rc_risk_text: str,
+        rc_lp_text: str,
+        rc_upd_short: str,
+    ) -> None:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO trade_intents (ts, ca, kind, ug_fast, ug_slow, velocity_mpm,
+                                           first_seen_ts, last_seen_ts, rc_score, rc_risk_text, rc_lp_text, rc_upd_short)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    ca,
+                    kind,
+                    ug_fast,
+                    ug_slow,
+                    velocity_mpm,
+                    first_seen_ts,
+                    last_seen_ts,
+                    rc_score,
+                    rc_risk_text,
+                    rc_lp_text,
+                    rc_upd_short,
+                ),
             )
             await db.commit()
 
