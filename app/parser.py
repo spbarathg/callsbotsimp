@@ -2,8 +2,8 @@ import re
 from typing import List, Set
 import base58
 
-# Base58 without 0,O,I,l and length 32-44 chars (Solana pubkey range)
-SOLANA_CA_PATTERN = re.compile(r"\b([1-9A-HJ-NP-Za-km-z]{32,44})(?:\b|$)")
+# Base58 without 0,O,I,l and length 32-48 chars (allow pump-style endings)
+SOLANA_CA_PATTERN = re.compile(r"\b([1-9A-HJ-NP-Za-km-z]{32,48})\b")
 
 # Common noise words to ignore (symbols, tickers, keywords)
 _NOISE: Set[str] = {
@@ -11,15 +11,11 @@ _NOISE: Set[str] = {
     "BUY", "buy", "Chart", "chart", "Link", "link",
 }
 
-_SUFFIXES: List[str] = ["pump", "\u200bpump"]
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff\u00a0"
 
 
-def _normalize(token: str) -> str:
-    t = token.strip()
-    for suf in _SUFFIXES:
-        if t.endswith(suf):
-            t = t[: -len(suf)]
-    return t
+def _strip_invisible(token: str) -> str:
+    return token.translate({ord(c): None for c in _INVISIBLE})
 
 
 def _is_valid_solana(addr: str) -> bool:
@@ -27,8 +23,21 @@ def _is_valid_solana(addr: str) -> bool:
         raw = base58.b58decode(addr)
     except Exception:
         return False
-    # Solana public key is 32 bytes
     return len(raw) == 32
+
+
+def _normalize_candidate(token: str) -> str:
+    t = _strip_invisible(token.strip())
+    # Accept pump-style mints as-is (Rugcheck and PF support these)
+    if t.endswith("pump"):
+        return t
+    # Standard 32-byte mint as-is
+    if _is_valid_solana(t):
+        return t
+    # Fallback: trim trailing 'pump' if present and validate
+    if t.endswith("pump") and _is_valid_solana(t[:-4]):
+        return t[:-4]
+    return ""
 
 
 def extract_solana_addresses(text: str) -> List[str]:
@@ -43,8 +52,8 @@ def extract_solana_addresses(text: str) -> List[str]:
             continue
         if token.startswith("0x"):
             continue
-        norm = _normalize(token)
-        if _is_valid_solana(norm):
+        norm = _normalize_candidate(token)
+        if norm:
             addresses.append(norm)
 
     # Deduplicate preserving order
