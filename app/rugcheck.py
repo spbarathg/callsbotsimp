@@ -6,9 +6,8 @@ import json as _json
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-# Fix for Windows aiodns issue
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# Do not mutate global event loop policy from a library module. If Windows-specific
+# policy is required for the top-level app, set it explicitly in the entrypoint.
 
 
 class RugcheckClient:
@@ -113,4 +112,25 @@ class RugcheckClient:
         lp_text = f"{round(lp_pct)}%" if isinstance(lp_pct, (int, float)) else "n/a"
         upd = (report.get("tokenMeta") or {}).get("updateAuthority")
         upd_short = f"{upd[:4]}…{upd[-4:]}" if isinstance(upd, str) and len(upd) > 8 else (upd or "n/a")
-        return (str(score) if score is not None else "n/a", risk_text, lp_text, upd_short)
+        # Normalize score to 0–10 range for display/storage
+        def _normalize_to_ten(val) -> str:
+            try:
+                v = float(val)
+            except Exception:
+                return "n/a"
+            if v <= 10:
+                s10 = v
+            elif v <= 100:
+                s10 = v / 10.0
+            elif v <= 1000:
+                s10 = v / 100.0
+            else:
+                s10 = 10.0
+            if s10 < 0:
+                s10 = 0.0
+            if s10 > 10:
+                s10 = 10.0
+            return f"{s10:.1f}"
+
+        norm_score = _normalize_to_ten(score) if score is not None else "n/a"
+        return (norm_score, risk_text, lp_text, upd_short)

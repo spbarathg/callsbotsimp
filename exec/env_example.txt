@@ -1,0 +1,49 @@
+# Executor Configuration Example
+# Copy to .env and fill in your values
+
+# CRITICAL: Your wallet private key (base58 format)
+EXECUTOR_PRIVATE_KEY=your_private_key_here_base58_format
+
+# RPC endpoints (recommend Helius Pro)
+EXECUTOR_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+EXECUTOR_BACKUP_RPC_URL=https://api.mainnet-beta.solana.com
+
+# Jupiter API (leave default unless using custom endpoint)
+JUPITER_API_URL=https://quote-api.jup.ag/v6
+
+# Jito (optional, for MEV protection)
+JITO_BUNDLE_URL=https://mainnet.block-engine.jito.wtf/api/v1/bundles
+JITO_TIP_LAMPORTS=10000
+
+# Position sizing
+BASE_POSITION_SIZE_USD=10.0
+
+# Risk limits
+MAX_SLIPPAGE_BPS=150          # 1.5% max slippage
+MAX_IMPACT_BPS=250            # 2.5% max price impact
+STOP_LOSS_BASE_PCT=0.50       # 50% base stop loss
+DAILY_LOSS_LIMIT_PCT=0.04     # 4% daily loss limit
+CONSECUTIVE_LOSS_LIMIT=4      # Stop after 4 consecutive losses
+
+# "Capture the Runner" Strategy Settings
+# (No entry gates needed - your monitor system already provides excellent signal quality)
+DISASTER_STOP_PCT=0.80                # -80% hard stop loss
+TIME_STOP_MINUTES=60                  # 60 minute time stop
+TIME_STOP_PROFIT_TARGET_PCT=0.50      # Need +50% to avoid time stop
+DERISKING_MULTIPLE=3.0                # De-risk at 3x
+DERISKING_SELL_PCT=0.33               # Sell 33% to de-risk
+RUNNER_TRAILING_STOP_PCT=0.30         # 30% trailing stop on runner
+
+# Extended scaling-out (never-ending profit taking)
+# CSV lists so it scales to 3000x+
+PROFIT_TIERS_CSV=5:0.10,8:0.10,13:0.10,21:0.10,34:0.10,55:0.10,89:0.10,144:0.10,233:0.10,377:0.10,610:0.10,987:0.10,1597:0.10
+TRAILING_ZONES_CSV=0:0.30,5:0.25,10:0.22,20:0.20,50:0.15,100:0.12,500:0.10,3000:0.08
+MIN_RUNNER_PCT=0.07
+PARTIAL_SELL_COOLDOWN_SEC=180
+
+# Performance tuning
+PRICE_CHECK_INTERVAL_MS=5000  # Check prices every 5 seconds
+MAX_CONCURRENT_POSITIONS=8    # Max 8 positions at once
+
+# Signal queue (shared with monitor)
+SIGNAL_QUEUE_PATH=data/executor_queue.json

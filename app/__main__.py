@@ -13,6 +13,13 @@ def setup_logging() -> None:
 
 def main() -> None:
     load_dotenv()
+    # Windows-specific selector policy if available; avoid mutating policy in libraries
+    try:
+        import os as _os
+        if _os.name == "nt":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
     setup_logging()
     settings = load_settings()
 

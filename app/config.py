@@ -23,6 +23,7 @@ class Settings:
     rc_timeout_ms: int
     monitored_groups: List[str]
     db_path: str
+    alert_coalesce_seconds: int
 
 
 def load_settings() -> Settings:
@@ -37,6 +38,7 @@ def load_settings() -> Settings:
     hot_ttl_seconds = int(os.getenv("HOT_TTL_SECONDS", "43200"))  # 12h
     fast_ttl_seconds = int(os.getenv("FAST_TTL_SECONDS", "1800"))  # 30m
     rc_timeout_ms = int(os.getenv("RC_TIMEOUT_MS", "400"))
+    alert_coalesce_seconds = int(os.getenv("ALERT_COALESCE_SECONDS", "3600"))
     monitored_groups = _parse_groups(os.getenv("MONITORED_GROUPS", ""))
 
     return Settings(
@@ -52,4 +54,5 @@ def load_settings() -> Settings:
         rc_timeout_ms=rc_timeout_ms,
         monitored_groups=monitored_groups,
         db_path=db_path,
+        alert_coalesce_seconds=alert_coalesce_seconds,
     )

@@ -1,5 +1,6 @@
 import asyncio
 import aiosqlite
+import json
 from typing import Any, Dict, Optional
 
 
@@ -16,6 +17,11 @@ class SignalRecorder:
             if self._initialized:
                 return
             async with aiosqlite.connect(self.db_path) as db:
+                # Performance and concurrency pragmas for WAL
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA synchronous=NORMAL")
+                await db.execute("PRAGMA temp_store=MEMORY")
+                await db.execute("PRAGMA mmap_size=268435456")
                 await db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS signals (
@@ -119,7 +125,7 @@ class SignalRecorder:
                     ug_slow,
                     hot_threshold,
                     sent_message_id,
-                    (None if extra is None else __import__("json").dumps(extra)),
+                    (None if extra is None else json.dumps(extra)),
                 ),
             )
             await db.commit()

@@ -12,6 +12,14 @@ from .rugcheck import RugcheckClient
 from .recorder import SignalRecorder
 from .events import SignalEvent, RugcheckEvent, MentionEvent, TradeIntentEvent
 
+# Import executor bridge for auto-trading
+try:
+    from exec.monitor_integration import ExecutorBridge
+    EXECUTOR_AVAILABLE = True
+except ImportError:
+    EXECUTOR_AVAILABLE = False
+    logging.warning("🤖 Executor not available - auto-trading disabled")
+
 
 class Monitor:
     def __init__(self, settings: Settings) -> None:
@@ -22,13 +30,18 @@ class Monitor:
         self.tracker_slow = HotTracker(settings.hot_ttl_seconds)
         self.rugcheck = RugcheckClient(settings.rc_timeout_ms)
         self.recorder = SignalRecorder(settings.db_path)
+        
+        # Initialize executor bridge for auto-trading
+        self.executor_bridge = ExecutorBridge() if EXECUTOR_AVAILABLE else None
+        if self.executor_bridge:
+            logging.info("🤖 Auto-trading bridge initialized")
         # In-process queues so recording never blocks Telegram handler
         self._signal_queue: asyncio.Queue[SignalEvent] = asyncio.Queue()
         self._rc_queue: asyncio.Queue[RugcheckEvent] = asyncio.Queue()
         self._mention_queue: asyncio.Queue[MentionEvent] = asyncio.Queue()
         self._intent_queue: asyncio.Queue[TradeIntentEvent] = asyncio.Queue()
         # Coalesce duplicate fast/slow alerts for the same CA within this window (seconds)
-        self._coalesce_seconds: int = 3600
+        self._coalesce_seconds: int = getattr(settings, "alert_coalesce_seconds", 3600)
         self._any_alerted_at: dict[str, float] = {}
 
     async def start(self) -> None:
@@ -90,7 +103,8 @@ class Monitor:
                 # Back off a bit longer on each retry to respect rate limits
                 await asyncio.sleep(0.7 * attempts)
 
-            rc_tail = f"RC: score {score} | risks: {risk_text} | LP {lp_text} | updAuth {upd_short}"
+            # score is normalized to 0–10 string; display as /10
+            rc_tail = f"RC: score {score}/10 | risks: {risk_text} | LP {lp_text} | updAuth {upd_short}"
             await message.edit(f"{message.raw_text} | {rc_tail}")
             # Record summarized RC
             await self._rc_queue.put(
@@ -207,6 +221,7 @@ class Monitor:
         while True:
             ev = await self._intent_queue.get()
             try:
+                # Record trade intent as before
                 await self.recorder.record_trade_intent(
                     ts=ev.ts,
                     ca=ev.ca,
@@ -221,6 +236,11 @@ class Monitor:
                     rc_lp_text=ev.rc_lp_text,
                     rc_upd_short=ev.rc_upd_short,
                 )
+                
+                # NEW: Send to executor for auto-trading
+                if self.executor_bridge:
+                    await self.executor_bridge.send_trade_intent(ev)
+                    
             except Exception as exc:
                 logging.exception(f"record_trade_intent failed: {exc}")
             finally:
@@ -238,12 +258,7 @@ class Monitor:
 
             text = event.raw_text or ""
 
-            if event.message and event.message.entities:
-                for ent in event.message.entities:
-                    if hasattr(ent, "offset") and hasattr(ent, "length"):
-                        part = text[ent.offset: ent.offset + ent.length]
-                        if part and part not in text:
-                            text += f" {part}"
+            # Redundant entity re-appending removed; raw_text already contains entity ranges
 
             addresses: List[str] = extract_solana_addresses(text)
             if not addresses:

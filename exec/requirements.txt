@@ -1,0 +1,15 @@
+# Core async and HTTP
+aiohttp==3.10.10
+aiofiles==24.1.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Solana blockchain interaction
+solders==0.21.0
+
+# Base58 encoding (for private keys)
+base58==2.1.1
+
+# Optional: For Jito bundle submission
+jito-py==0.1.0
