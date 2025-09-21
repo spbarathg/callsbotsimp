@@ -13,7 +13,8 @@ class Monitor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = TelegramClient(settings.session, settings.api_id, settings.api_hash)
-        self.tracker = HotTracker(settings.hot_ttl_seconds)
+        self.tracker_fast = HotTracker(settings.fast_ttl_seconds)
+        self.tracker_slow = HotTracker(settings.hot_ttl_seconds)
 
     async def start(self) -> None:
         logging.info("🚀 Starting Telegram client…")
@@ -23,8 +24,11 @@ class Monitor:
         self.client.add_event_handler(self._on_message, events.NewMessage(chats=self.settings.monitored_groups))
         await self.client.run_until_disconnected()
 
-    def _signal_message(self, ca: str) -> str:
-        return f"🔥 {self.settings.hot_threshold}x group signal — {ca}"
+    def _signal_message_fast(self, ca: str) -> str:
+        return f"⚡ Fast signal {self.settings.hot_threshold}x — {ca}"
+
+    def _signal_message_slow(self, ca: str) -> str:
+        return f"🔥 Signal {self.settings.hot_threshold}x — {ca}"
 
     async def _on_message(self, event) -> None:
         try:
@@ -55,11 +59,22 @@ class Monitor:
                 if ca in seen:
                     continue
                 seen.add(ca)
-                unique_groups = self.tracker.add_hit(ca, group_id)
-                logging.info(f"👀 {group_name} → {ca} ({unique_groups}/{self.settings.hot_threshold})")
-                if self.tracker.should_alert(ca, self.settings.hot_threshold):
-                    msg = self._signal_message(ca)
-                    # Log the same clean message and send it
+
+                # Update both trackers (per-group dedupe already handled here)
+                ug_fast = self.tracker_fast.add_hit(ca, group_id)
+                ug_slow = self.tracker_slow.add_hit(ca, group_id)
+                logging.info(f"👀 {group_name} → {ca} (fast {ug_fast}/{self.settings.hot_threshold}, slow {ug_slow}/{self.settings.hot_threshold})")
+
+                # Fast tier
+                if self.tracker_fast.should_alert(ca, self.settings.hot_threshold):
+                    msg = self._signal_message_fast(ca)
+                    logging.info(msg)
+                    await self.client.send_message(self.settings.target_group, msg)
+                    logging.info("📣 Fast signal sent")
+
+                # Slow tier
+                if self.tracker_slow.should_alert(ca, self.settings.hot_threshold):
+                    msg = self._signal_message_slow(ca)
                     logging.info(msg)
                     await self.client.send_message(self.settings.target_group, msg)
                     logging.info("📣 Signal sent")
