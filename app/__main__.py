@@ -16,6 +16,9 @@ def main() -> None:
     setup_logging()
     settings = load_settings()
 
+    # Ensure data directory exists for session and caches
+    os.makedirs(settings.data_dir, exist_ok=True)
+
     if settings.api_id == 0 or not settings.api_hash:
         logging.error("API_ID/API_HASH are required. Set them in environment or .env")
         return
