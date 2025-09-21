@@ -74,8 +74,22 @@ class Monitor:
 
     async def _append_rc_and_edit(self, message, ca: str) -> None:
         try:
-            report = await self.rugcheck.fetch_report(ca)
-            score, risk_text, lp_text, upd_short = RugcheckClient.summarize(report or {})
+            # Try a few times in case Rugcheck is rate-limiting (429)
+            attempts = 0
+            score = risk_text = lp_text = upd_short = "pending"
+            while attempts < 4:
+                attempts += 1
+                try:
+                    report = await self.rugcheck.fetch_report(ca)
+                    score, risk_text, lp_text, upd_short = RugcheckClient.summarize(report or {})
+                    # If we got a concrete score (not pending), stop retrying
+                    if score != "pending":
+                        break
+                except Exception:
+                    pass
+                # Back off a bit longer on each retry to respect rate limits
+                await asyncio.sleep(0.7 * attempts)
+
             rc_tail = f"RC: score {score} | risks: {risk_text} | LP {lp_text} | updAuth {upd_short}"
             await message.edit(f"{message.raw_text} | {rc_tail}")
             # Record summarized RC
