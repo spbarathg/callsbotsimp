@@ -13,6 +13,7 @@ from .signer import EphemeralSigner
 from .risk_manager import RiskManager
 from .metrics import LatencyTracker, start_metrics_server, ORDERS_ABORTED_LATENCY, ORDERS_STARTED, ORDERS_CONFIRMED, ORDERS_FAILED, BOTS_TRADES_TOTAL, BOTS_TRADES_WON
 from .order_manager import OrderManager
+from app.onchain import OnchainAnalyzer
 # EntryGates removed - your monitor system already provides excellent signal quality
 
 
@@ -75,6 +76,8 @@ class MemecoinExecutor:
         self._sol_price_last_fetch: float = 0.0
         # Provide portfolio value fetcher to risk manager
         self.risk_manager._account_value_fetcher = self._estimate_account_value
+        # Pre-trade onchain analyzer (lazy)
+        self._pretrade_analyzer: OnchainAnalyzer | None = None
     
     async def start(self):
         """Start the executor engine"""
@@ -144,9 +147,10 @@ class MemecoinExecutor:
                     new_signals.append((msg_id, signal))
                 
                 for msg_id, signal in new_signals:
-                    # Idempotency check
-                    sig_id = getattr(signal, 'signal_id', None) or f"{signal.ca}:{int(signal.first_seen_ts or signal.timestamp)}"
-                    if await self.idempotency.has_processed(sig_id):
+            # Idempotency check
+            sig_id = getattr(signal, 'signal_id', None) or f"{signal.ca}:{int(signal.first_seen_ts or signal.timestamp)}"
+            # Optional Redis idempotency could be added here guarded by settings.idempotency_backend
+            if await self.idempotency.has_processed(sig_id):
                         if msg_id:
                             await self.signal_queue.ack(msg_id)
                         continue
@@ -199,6 +203,31 @@ class MemecoinExecutor:
                 logging.info(f"⛔ Duplicate lock active for {signal.ca}; skipping")
                 return
             try:
+                # Pre-trade micro-guard (non-blocking budget)
+                if getattr(self.settings, 'pretrade_onchain_guard', False):
+                    try:
+                        if self._pretrade_analyzer is None:
+                            # Use app config RPC defaults if available; fall back to executor RPC
+                            rpc_url = getattr(self.settings, 'rpc_url', None) or "https://api.mainnet-beta.solana.com"
+                            self._pretrade_analyzer = OnchainAnalyzer(rpc_url, timeout_ms=getattr(self.settings, 'pretrade_timeout_ms', 150))
+                        analysis = await asyncio.wait_for(self._pretrade_analyzer.analyze(signal.ca), timeout=(getattr(self.settings, 'pretrade_timeout_ms', 150)/1000.0))
+                    except Exception:
+                        analysis = None
+                    decision = True
+                    reason = "OK"
+                    if analysis:
+                        top1 = float(analysis.get('top1_pct', 0.0))
+                        top10 = float(analysis.get('top10_pct', 0.0))
+                        if top1 >= self.settings.pretrade_top1_max_pct or top10 >= self.settings.pretrade_top10_max_pct:
+                            decision = False
+                            reason = f"holder concentration top1={top1:.1f} top10={top10:.1f}"
+                    else:
+                        if str(getattr(self.settings, 'pretrade_fail_mode', 'soft')).lower() == 'hard':
+                            decision = False
+                            reason = "pretrade timeout"
+                    if not decision:
+                        logging.info(f"🛑 Pre-trade guard rejected {signal.ca}: {reason}")
+                        return
                 # Pre-trade rugcheck gates
                 risks_lower = (signal.rugcheck_risks or "").lower()
                 if any(flag in risks_lower for flag in ["honeypot", "blacklist", "blacklisted"]):
@@ -445,11 +474,31 @@ class MemecoinExecutor:
             
             position.last_price_check = time.time()
             
-            # Check exit conditions (staged exits 30% at 2x, 30% at 5x handled by risk_manager tiers config)
+            # Check exit conditions (staged exits handled by risk_manager tiers config)
             should_exit, exit_reason, sell_percentage = self.risk_manager.should_exit_position(position, current_price)
             
             if should_exit:
                 await self._execute_sell(position, sell_percentage, exit_reason, current_price)
+                return
+
+            # Near-stop turbo: if within configured delta of any active stop/target, recheck sooner
+            try:
+                delta_pct = getattr(self.settings, 'near_stop_delta_pct', 0.03)
+                turbo_ms = getattr(self.settings, 'near_stop_check_ms', 150)
+                # Evaluate proximity to stop_loss or runner trailing implied stop
+                targets = []
+                if position.stop_loss_price and position.stop_loss_price > 0:
+                    targets.append(position.stop_loss_price)
+                if position.is_derisked and position.runner_peak_price > 0:
+                    # Approximate current trailing stop price using last known zone calculation
+                    trail_pct = self.settings.runner_trailing_stop_pct
+                    targets.append(max(position.runner_peak_price * (1 - trail_pct), position.entry_price))
+                for t in targets:
+                    if t > 0 and abs(current_price - t) / max(t, 1e-12) <= delta_pct:
+                        await asyncio.sleep(turbo_ms / 1000.0)
+                        return
+            except Exception:
+                pass
             
         except Exception as e:
             logging.error(f"Position management error for {position.ca}: {e}")

@@ -56,6 +56,26 @@ class ExecutorSettings:
     redis_consumer_group: str
     redis_consumer_name: str
 
+    # Pre-trade micro-guard
+    pretrade_onchain_guard: bool
+    pretrade_timeout_ms: int
+    pretrade_top1_max_pct: float
+    pretrade_top10_max_pct: float
+    pretrade_fail_mode: str  # "soft" | "hard"
+    pretrade_min_liq_usd: float
+
+    # Quality score enhancements
+    quality_diversity_min_groups: int
+    quality_min_weighted_score: float
+
+    # Exit polling tuning
+    near_stop_delta_pct: float
+    near_stop_check_ms: int
+
+    # Idempotency backend
+    idempotency_backend: str  # "sqlite" | "redis"
+    idempotency_ttl_sec: int
+
 
 def load_executor_settings() -> ExecutorSettings:
     return ExecutorSettings(
@@ -109,4 +129,24 @@ def load_executor_settings() -> ExecutorSettings:
         redis_stream_key=os.getenv("REDIS_STREAM_KEY", "exec_signals"),
         redis_consumer_group=os.getenv("REDIS_CONSUMER_GROUP", "executor"),
         redis_consumer_name=os.getenv("REDIS_CONSUMER_NAME", "worker-1"),
+
+        # Pre-trade micro-guard
+        pretrade_onchain_guard=os.getenv("PRETRADE_ONCHAIN_GUARD", "true").lower() == "true",
+        pretrade_timeout_ms=int(os.getenv("PRETRADE_TIMEOUT_MS", "150")),
+        pretrade_top1_max_pct=float(os.getenv("PRETRADE_TOP1_MAX_PCT", "90")),
+        pretrade_top10_max_pct=float(os.getenv("PRETRADE_TOP10_MAX_PCT", "99")),
+        pretrade_fail_mode=os.getenv("PRETRADE_FAIL_MODE", "soft"),
+        pretrade_min_liq_usd=float(os.getenv("PRETRADE_MIN_LIQ_USD", "0")),
+
+        # Quality score enhancements
+        quality_diversity_min_groups=int(os.getenv("QUALITY_DIVERSITY_MIN_GROUPS", "1")),
+        quality_min_weighted_score=float(os.getenv("QUALITY_MIN_WEIGHTED_SCORE", "0.6")),
+
+        # Exit polling tuning
+        near_stop_delta_pct=float(os.getenv("NEAR_STOP_DELTA_PCT", "0.03")),
+        near_stop_check_ms=int(os.getenv("NEAR_STOP_CHECK_MS", "150")),
+
+        # Idempotency backend
+        idempotency_backend=os.getenv("IDEMPOTENCY_BACKEND", "sqlite"),
+        idempotency_ttl_sec=int(os.getenv("IDEMPOTENCY_TTL_SEC", "172800")),
     )

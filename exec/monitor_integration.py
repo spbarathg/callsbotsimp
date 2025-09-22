@@ -63,15 +63,17 @@ class ExecutorBridge:
                 rugcheck_risks=trade_intent_data['rc_risk_text'],
                 rugcheck_lp=trade_intent_data['rc_lp_text']
             )
+            # Enhanced quality score with diversity and diminishing returns
             base_quality = 0.6
-            group_boost = min(0.2, (signal.ug_fast - 4) * 0.05)
+            unique_groups = max(signal.ug_fast, 0)
+            diversity_boost = min(0.2, max(0, unique_groups - 1) * 0.05)
             velocity_boost = min(0.1, signal.velocity_mpm / 10.0)
             age_penalty = 0.0
             if signal.first_seen_ts:
                 age_minutes = (signal.timestamp - signal.first_seen_ts) / 60.0
                 if age_minutes > 30:
                     age_penalty = min(0.2, (age_minutes - 30) / 60.0)
-            signal.quality_score = max(0.3, min(1.0, base_quality + group_boost + velocity_boost - age_penalty))
+            signal.quality_score = max(0.3, min(1.0, base_quality + diversity_boost + velocity_boost - age_penalty))
             await self.signal_queue.put_signal(signal)
             
         except Exception as e:
