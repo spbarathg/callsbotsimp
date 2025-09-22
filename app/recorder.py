@@ -83,12 +83,27 @@ class SignalRecorder:
                     )
                     """
                 )
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS onchain (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts INTEGER NOT NULL,
+                        ca TEXT NOT NULL,
+                        supply_total REAL,
+                        decimals INTEGER,
+                        top1_pct REAL,
+                        top10_pct REAL,
+                        holders_sampled INTEGER
+                    )
+                    """
+                )
                 # Indexes for efficiency
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_signals_ca ON signals(ca)")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_mentions_ca_ts ON mentions(ca, ts)")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_intents_ts ON trade_intents(ts)")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_intents_ca ON trade_intents(ca)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_onchain_ca_ts ON onchain(ca, ts)")
                 await db.commit()
             self._initialized = True
 
@@ -191,6 +206,36 @@ class SignalRecorder:
                     rc_risk_text,
                     rc_lp_text,
                     rc_upd_short,
+                ),
+            )
+            await db.commit()
+
+    async def record_onchain(
+        self,
+        *,
+        ts: int,
+        ca: str,
+        supply_total: float,
+        decimals: int,
+        top1_pct: float,
+        top10_pct: float,
+        holders_sampled: int,
+    ) -> None:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO onchain (ts, ca, supply_total, decimals, top1_pct, top10_pct, holders_sampled)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    ca,
+                    supply_total,
+                    decimals,
+                    top1_pct,
+                    top10_pct,
+                    holders_sampled,
                 ),
             )
             await db.commit()

@@ -50,6 +50,8 @@ class Settings:
     monitored_groups: List[str]
     db_path: str
     alert_coalesce_seconds: int
+    rpc_url: str = "https://api.mainnet-beta.solana.com"
+    rpc_timeout_ms: int = 800
 
 
 def load_settings() -> Settings:
@@ -65,6 +67,8 @@ def load_settings() -> Settings:
     fast_ttl_seconds = int(os.getenv("FAST_TTL_SECONDS", "1800"))  # 30m
     rc_timeout_ms = int(os.getenv("RC_TIMEOUT_MS", "400"))
     alert_coalesce_seconds = int(os.getenv("ALERT_COALESCE_SECONDS", "3600"))
+    rpc_url = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+    rpc_timeout_ms = int(os.getenv("RPC_TIMEOUT_MS", "800"))
     monitored_groups = _parse_groups(os.getenv("MONITORED_GROUPS", ""))
 
     return Settings(
@@ -81,4 +85,6 @@ def load_settings() -> Settings:
         monitored_groups=monitored_groups,
         db_path=db_path,
         alert_coalesce_seconds=alert_coalesce_seconds,
+        rpc_url=rpc_url,
+        rpc_timeout_ms=rpc_timeout_ms,
     )

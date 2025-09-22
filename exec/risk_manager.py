@@ -76,17 +76,17 @@ class RiskManager:
         
         # Adjust based on rugcheck score (normalized 0–10 string)
         if position.rugcheck_score == "pending" or position.rugcheck_score == "n/a":
-            risk_multiplier = 1.5  # 50% tighter stops for unknown risk
+            risk_multiplier = 0.7  # Looser stops (allow more room) when unknown
         else:
             try:
                 score = float(position.rugcheck_score)
             except Exception:
                 score = 10.0
-            if score >= 8:      # High risk (8-10)
+            if score <= 3:      # High risk (0-3)
                 risk_multiplier = 1.4
-            elif score >= 6:    # Medium risk (6-7)
+            elif score <= 6:    # Medium risk (4-6)
                 risk_multiplier = 1.2
-            elif score <= 3:    # Low risk (0-3)
+            elif score >= 8:    # Low risk (8-10)
                 risk_multiplier = 0.8  # 20% looser stops
         
         # Check specific risk flags
@@ -103,7 +103,7 @@ class RiskManager:
             risk_multiplier *= 1.2  # Tighter stops for unlocked LP
         
         # Calculate final stop loss
-        adjusted_stop_pct = min(0.70, base_stop_pct * risk_multiplier)  # Never tighter than 70%
+        adjusted_stop_pct = max(0.10, min(0.90, base_stop_pct * risk_multiplier))
         stop_loss_price = position.entry_price * (1 - adjusted_stop_pct)
         
         return stop_loss_price
@@ -137,8 +137,14 @@ class RiskManager:
         
         # 1. DISASTER STOP-LOSS: -80% hard stop
         disaster_stop_price = position.entry_price * (1 - self.settings.disaster_stop_pct)
-        if current_price <= disaster_stop_price:
+        # Tolerate floating point rounding at boundaries
+        if current_price <= (disaster_stop_price + 1e-12):
             logging.warning(f"💥 DISASTER STOP triggered for {position.ca}: {current_multiple:.2f}x")
+            return True, ExitReason.STOP_LOSS, 1.0
+
+        # 1b. BASE STOP-LOSS: configurable risk-adjusted stop price
+        if position.stop_loss_price and position.stop_loss_price > 0 and current_price <= position.stop_loss_price:
+            logging.info(f"🛑 STOP LOSS triggered for {position.ca}: price {current_price:.8f} <= stop {position.stop_loss_price:.8f}")
             return True, ExitReason.STOP_LOSS, 1.0
         
         # 2. TIME STOP: risk-adjusted minutes if not reaching profit target
@@ -185,6 +191,9 @@ class RiskManager:
         # 5. RUNNER TRAILING STOP: ratcheting by zones
         if position.is_derisked:
             # Update runner peak
+            # Initialize runner peak from existing peak if missing
+            if position.runner_peak_price <= 0:
+                position.runner_peak_price = max(position.peak_price, position.entry_price)
             if current_price > position.runner_peak_price:
                 position.runner_peak_price = current_price
 
@@ -204,7 +213,8 @@ class RiskManager:
 
             trailing_stop_price = position.runner_peak_price * (1 - trail_pct)
             final_stop_price = max(trailing_stop_price, position.entry_price)
-            if current_price <= final_stop_price:
+            # Include a small epsilon for float boundary
+            if current_price <= (final_stop_price + 1e-12):
                 logging.info(f"🏃 RUNNER STOP triggered for {position.ca}: peak {position.runner_peak_price/position.entry_price:.2f}x, current {current_multiple:.2f}x, trail {trail_pct:.0%}")
                 return True, ExitReason.TRAILING_STOP, 1.0
         
@@ -273,6 +283,10 @@ class RiskManager:
         """Halt trading for specified hours"""
         self.portfolio_stats.trading_halted_until = time.time() + (hours * 3600)
         logging.warning(f"🛑 Trading halted for {hours} hours: {reason}")
+
+    # Public helper for tests and controls
+    def halt_trading(self, duration_minutes: int = 30):
+        self._halt_trading(hours=duration_minutes / 60.0, reason="manual halt")
     
     def get_estimated_account_value(self) -> float:
         """Estimate total account value (implement based on your needs)"""

@@ -11,7 +11,8 @@ from .parser import extract_solana_addresses
 from .tracker import HotTracker
 from .rugcheck import RugcheckClient
 from .recorder import SignalRecorder
-from .events import SignalEvent, RugcheckEvent, MentionEvent, TradeIntentEvent
+from .events import SignalEvent, RugcheckEvent, MentionEvent, TradeIntentEvent, OnchainEvent
+from .onchain import OnchainAnalyzer
 
 # Import executor bridge for auto-trading
 try:
@@ -31,6 +32,7 @@ class Monitor:
         self.tracker_slow = HotTracker(settings.hot_ttl_seconds)
         self.rugcheck = RugcheckClient(settings.rc_timeout_ms)
         self.recorder = SignalRecorder(settings.db_path)
+        self.onchain = OnchainAnalyzer(settings.rpc_url, getattr(settings, "rpc_timeout_ms", 800))
         
         # Initialize executor bridge for auto-trading with explicit env guard
         self.executor_bridge = None
@@ -48,6 +50,7 @@ class Monitor:
         self._rc_queue: asyncio.Queue[RugcheckEvent] = asyncio.Queue()
         self._mention_queue: asyncio.Queue[MentionEvent] = asyncio.Queue()
         self._intent_queue: asyncio.Queue[TradeIntentEvent] = asyncio.Queue()
+        self._onchain_queue: asyncio.Queue[OnchainEvent] = asyncio.Queue()
         # Coalesce duplicate fast/slow alerts for the same CA within this window (seconds)
         self._coalesce_seconds: int = getattr(settings, "alert_coalesce_seconds", 3600)
         self._any_alerted_at: dict[str, float] = {}
@@ -64,6 +67,7 @@ class Monitor:
             asyncio.create_task(self._consume_rugcheck()),
             asyncio.create_task(self._consume_mentions()),
             asyncio.create_task(self._consume_intents()),
+            asyncio.create_task(self._consume_onchain()),
             asyncio.create_task(self._maintenance_task()),
         ]
         try:
@@ -72,6 +76,10 @@ class Monitor:
             for c in consumers:
                 c.cancel()
             await self.rugcheck.close()
+            try:
+                await self.onchain.close()
+            except Exception:
+                pass
 
     async def _maintenance_task(self) -> None:
         try:
@@ -123,6 +131,35 @@ class Monitor:
                     risk_text=risk_text,
                     lp_text=lp_text,
                     upd_short=upd_short,
+                )
+            )
+            # Kick off on-chain analysis (does not block)
+            asyncio.create_task(self._append_onchain_and_record(message, ca))
+        except Exception:
+            pass
+
+    async def _append_onchain_and_record(self, message, ca: str) -> None:
+        try:
+            analysis = await self.onchain.analyze(ca)
+            if not analysis:
+                return
+            top1 = round(analysis["top1_pct"], 1)
+            top10 = round(analysis["top10_pct"], 1)
+            holders = analysis["holders_sampled"]
+            oc_tail = f"Holders: top1 {top1}% | top10 {top10}% (n={holders})"
+            try:
+                await message.edit(f"{message.raw_text} | {oc_tail}")
+            except Exception:
+                pass
+            await self._onchain_queue.put(
+                OnchainEvent(
+                    ts=int(time.time()),
+                    ca=ca,
+                    supply_total=float(analysis["supply_total"]),
+                    decimals=int(analysis["decimals"]),
+                    top1_pct=float(analysis["top1_pct"]),
+                    top10_pct=float(analysis["top10_pct"]),
+                    holders_sampled=int(analysis["holders_sampled"]),
                 )
             )
         except Exception:
@@ -208,6 +245,24 @@ class Monitor:
                 logging.exception(f"record_rugcheck failed: {exc}")
             finally:
                 self._rc_queue.task_done()
+
+    async def _consume_onchain(self) -> None:
+        while True:
+            ev = await self._onchain_queue.get()
+            try:
+                await self.recorder.record_onchain(
+                    ts=ev.ts,
+                    ca=ev.ca,
+                    supply_total=ev.supply_total,
+                    decimals=ev.decimals,
+                    top1_pct=ev.top1_pct,
+                    top10_pct=ev.top10_pct,
+                    holders_sampled=ev.holders_sampled,
+                )
+            except Exception as exc:
+                logging.exception(f"record_onchain failed: {exc}")
+            finally:
+                self._onchain_queue.task_done()
 
     async def _consume_mentions(self) -> None:
         while True:

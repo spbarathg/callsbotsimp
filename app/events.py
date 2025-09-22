@@ -50,3 +50,14 @@ class TradeIntentEvent:
     rc_risk_text: str
     rc_lp_text: str
     rc_upd_short: str
+
+
+@dataclass
+class OnchainEvent:
+    ts: int
+    ca: str
+    supply_total: float
+    decimals: int
+    top1_pct: float
+    top10_pct: float
+    holders_sampled: int
