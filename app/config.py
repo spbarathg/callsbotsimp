@@ -3,10 +3,36 @@ from dataclasses import dataclass
 from typing import List
 
 
+ALLOWED_GROUPS: List[str] = [
+    '@MooDengPresidentCallers',
+    '@Bot_NovaX',
+    '@Ranma_Calls_Solana',
+    '@MarksGems',
+    '@Alphakollswithins',
+    '@mattprintalphacalls',
+    '@ReVoX_Academy',
+    '@pfultimate',
+    '@pumpfunvolumeby4AM',
+    '@SouthParkCall',
+    '@batman_gem',
+    '@wifechangingcallss',
+    '@SAVANNAHCALLS',
+]
+
+
 def _parse_groups(value: str) -> List[str]:
+    """Parse MONITORED_GROUPS env and restrict to ALLOWED_GROUPS.
+
+    If env is empty, default to ALLOWED_GROUPS.
+    """
     if not value:
-        return []
-    return [g.strip() for g in value.split(",") if g.strip()]
+        return list(ALLOWED_GROUPS)
+    parsed = [g.strip() for g in value.split(",") if g.strip()]
+    # Restrict to allowed set while preserving order of parsed
+    allowed_set = set(ALLOWED_GROUPS)
+    filtered = [g for g in parsed if g in allowed_set]
+    # If user provided none of the allowed, fall back to default allowed
+    return filtered or list(ALLOWED_GROUPS)
 
 
 @dataclass

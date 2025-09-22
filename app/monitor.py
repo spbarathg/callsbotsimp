@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import List
 
 from telethon import TelegramClient, events
@@ -31,10 +32,17 @@ class Monitor:
         self.rugcheck = RugcheckClient(settings.rc_timeout_ms)
         self.recorder = SignalRecorder(settings.db_path)
         
-        # Initialize executor bridge for auto-trading
-        self.executor_bridge = ExecutorBridge() if EXECUTOR_AVAILABLE else None
-        if self.executor_bridge:
-            logging.info("🤖 Auto-trading bridge initialized")
+        # Initialize executor bridge for auto-trading with explicit env guard
+        self.executor_bridge = None
+        if EXECUTOR_AVAILABLE and os.getenv("REDIS_URL"):
+            try:
+                self.executor_bridge = ExecutorBridge()
+                logging.info("Auto-trading bridge initialized")
+            except Exception as e:
+                self.executor_bridge = None
+                logging.warning(f"Auto-trading disabled: {e}")
+        else:
+            logging.info("Auto-trading disabled: REDIS_URL not set or executor unavailable")
         # In-process queues so recording never blocks Telegram handler
         self._signal_queue: asyncio.Queue[SignalEvent] = asyncio.Queue()
         self._rc_queue: asyncio.Queue[RugcheckEvent] = asyncio.Queue()

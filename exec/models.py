@@ -27,6 +27,8 @@ class Position:
     size_usd: float
     size_tokens: float
     entry_signature: str
+    # Optional identifiers should come after non-default fields
+    signal_id: str | None = None
     
     # Rugcheck data for risk adjustment
     rugcheck_score: str = "pending"
@@ -133,3 +135,5 @@ class SignalData:
     
     # Computed quality score
     quality_score: float = 0.0
+    # Optional unique id for idempotency (e.g., sha1 of ca+first_seen/timestamp)
+    signal_id: Optional[str] = None

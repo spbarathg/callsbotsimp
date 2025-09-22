@@ -2,34 +2,63 @@ import asyncio
 import logging
 import time
 from typing import Dict, Optional, Set
-from dataclasses import asdict
 
 from .config import ExecutorSettings
 from .models import Position, PositionStatus, ExitReason, SignalData, TradeResult
-from .queue_bridge import FastSignalQueue
+from .redis_queue import RedisSignalQueue
+from .idempotency import IdempotencyStore
 from .jupiter_client import JupiterClient, PriceMonitor
 from .wallet import SolanaWallet
+from .signer import EphemeralSigner
 from .risk_manager import RiskManager
+from .metrics import LatencyTracker, start_metrics_server, ORDERS_ABORTED_LATENCY, ORDERS_STARTED, ORDERS_CONFIRMED, ORDERS_FAILED, BOTS_TRADES_TOTAL, BOTS_TRADES_WON
+from .order_manager import OrderManager
 # EntryGates removed - your monitor system already provides excellent signal quality
 
 
 class MemecoinExecutor:
     """Ultra-low latency memecoin execution engine"""
     
-    def __init__(self, settings: ExecutorSettings):
+    def __init__(
+        self,
+        settings: ExecutorSettings,
+        wallet: Optional["SolanaWallet"] = None,
+        signer: Optional["EphemeralSigner"] = None,
+        jupiter: Optional["JupiterClient"] = None,
+        price_monitor: Optional["PriceMonitor"] = None,
+        idempotency: Optional["IdempotencyStore"] = None,
+        order_manager: Optional["OrderManager"] = None,
+        signal_queue: Optional[object] = None,
+    ):
         self.settings = settings
         
         # Core components
-        self.wallet = SolanaWallet(
-            settings.private_key, 
+        self.wallet = wallet or SolanaWallet(
+            settings.private_key,
             settings.rpc_url,
             settings.backup_rpc_url,
             settings.jito_bundle_url
         )
-        self.jupiter = JupiterClient(settings.jupiter_api_url)
-        self.price_monitor = PriceMonitor(self.jupiter)
+        self.signer = signer or EphemeralSigner(settings.private_key)
+        self.jupiter = jupiter or JupiterClient(settings.jupiter_api_url)
+        self.price_monitor = price_monitor or PriceMonitor(self.jupiter)
         self.risk_manager = RiskManager(settings)
-        self.signal_queue = FastSignalQueue(settings.signal_queue_path)
+        # Require Redis Streams queue for production
+        if signal_queue is not None:
+            self.signal_queue = signal_queue
+        else:
+            if not getattr(settings, 'redis_url', None):
+                raise ValueError("Redis URL is required for executor signal queue")
+            self.signal_queue = RedisSignalQueue(
+                settings.redis_url,
+                settings.redis_stream_key,
+                settings.redis_consumer_group,
+                consumer="executor"
+            )
+        # Idempotency store
+        self.idempotency = idempotency or IdempotencyStore()
+        # Order manager and locks
+        self.order_manager = order_manager or OrderManager(getattr(settings, 'redis_url', None))
         
         # State tracking
         self.positions: Dict[str, Position] = {}
@@ -51,6 +80,31 @@ class MemecoinExecutor:
         """Start the executor engine"""
         
         logging.info("🚀 Starting Memecoin Executor...")
+        start_metrics_server()
+
+        # Resume any in-flight orders from SQLite
+        try:
+            inflight = await self.idempotency.load_positions_by_status("active")
+            if inflight:
+                logging.info(f"Resuming {len(inflight)} in-flight orders from persistence")
+                for rec in inflight:
+                    ca = rec["mint"]
+                    # Minimal reconstruction
+                    self.positions[ca] = Position(
+                        ca=ca,
+                        entry_price=float(rec.get("entry_price") or 0.0),
+                        entry_time=float(rec.get("entry_time") or 0.0),
+                        size_usd=float(rec.get("size_usd") or 0.0),
+                        size_tokens=float(rec.get("size_tokens") or 0.0),
+                        entry_signature=str(rec.get("entry_signature") or ""),
+                        token_decimals=int(rec.get("token_decimals") or 9),
+                        rugcheck_score="pending",
+                        rugcheck_risks="pending",
+                        rugcheck_lp_locked=False,
+                    )
+                    self.risk_manager.portfolio_stats.active_positions += 1
+        except Exception as e:
+            logging.error(f"Failed to resume in-flight orders: {e}")
         
         # Validate wallet
         balance = await self.wallet.get_balance()
@@ -83,16 +137,24 @@ class MemecoinExecutor:
         while self.is_running:
             try:
                 # Get new signals
-                new_signals = await self.signal_queue.get_new_signals(
-                    self.last_processed_signal_time
-                )
+                # Redis queue returns list of (msg_id, SignalData)
+                new_signals = []
+                entries = await self.signal_queue.read_new()
+                for msg_id, signal in entries:
+                    new_signals.append((msg_id, signal))
                 
-                for signal in new_signals:
+                for msg_id, signal in new_signals:
+                    # Idempotency check
+                    sig_id = getattr(signal, 'signal_id', None) or f"{signal.ca}:{int(signal.first_seen_ts or signal.timestamp)}"
+                    if await self.idempotency.has_processed(sig_id):
+                        if msg_id:
+                            await self.signal_queue.ack(msg_id)
+                        continue
                     await self._process_signal(signal)
-                    self.last_processed_signal_time = max(
-                        self.last_processed_signal_time, 
-                        signal.timestamp
-                    )
+                    await self.idempotency.mark_processed(sig_id)
+                    if msg_id:
+                        await self.signal_queue.ack(msg_id)
+                    self.last_processed_signal_time = max(self.last_processed_signal_time, signal.timestamp)
                 
                 await asyncio.sleep(0.1)  # 100ms loop for ultra-low latency
                 
@@ -105,6 +167,7 @@ class MemecoinExecutor:
         
         try:
             self.total_signals_processed += 1
+            tracker = LatencyTracker()
             
             # Skip if already holding this token
             if signal.ca in self.positions:
@@ -129,30 +192,41 @@ class MemecoinExecutor:
                 logging.info(f"⛔ Trade blocked: {signal.ca} - {reason}")
                 return
 
-            # Pre-trade rugcheck gates
-            risks_lower = (signal.rugcheck_risks or "").lower()
-            if any(flag in risks_lower for flag in ["honeypot", "blacklist", "blacklisted"]):
-                logging.info(f"🛑 Skip {signal.ca} due to rug flags: {signal.rugcheck_risks}")
+            # Token-level lock to prevent duplicates while order is running
+            lock_key = f"{signal.ca}:{getattr(signal, 'signal_id', '')}"
+            acquired = await self.order_manager.acquire_lock(lock_key, ttl_ms=120000)
+            if not acquired:
+                logging.info(f"⛔ Duplicate lock active for {signal.ca}; skipping")
                 return
-            # Optional: basic LP/tax sanity via rugcheck text if provided
-            if "high_tax" in risks_lower:
-                logging.info(f"🛑 Skip {signal.ca} due to high tax flag")
-                return
-            
-            # Calculate position size ($10 base)
-            position_size_usd = self.settings.base_position_size_usd
-            
-            # Execute buy
-            await self._execute_buy(signal, position_size_usd)
+            try:
+                # Pre-trade rugcheck gates
+                risks_lower = (signal.rugcheck_risks or "").lower()
+                if any(flag in risks_lower for flag in ["honeypot", "blacklist", "blacklisted"]):
+                    logging.info(f"🛑 Skip {signal.ca} due to rug flags: {signal.rugcheck_risks}")
+                    return
+                # Optional: basic LP/tax sanity via rugcheck text if provided
+                if "high_tax" in risks_lower:
+                    logging.info(f"🛑 Skip {signal.ca} due to high tax flag")
+                    return
+                
+                # Calculate position size ($10 base)
+                position_size_usd = self.settings.base_position_size_usd
+                
+                # Execute buy
+                await self._execute_buy(signal, position_size_usd, tracker)
+            finally:
+                await self.order_manager.release_lock(lock_key)
             
         except Exception as e:
             logging.error(f"Signal processing error for {signal.ca}: {e}")
     
-    async def _execute_buy(self, signal: SignalData, size_usd: float):
+    async def _execute_buy(self, signal: SignalData, size_usd: float, tracker: LatencyTracker):
         """Execute buy order for signal"""
         
         try:
             logging.info(f"🎯 Executing buy: {signal.ca} for ${size_usd:.2f}")
+            # Robust signal id for persistence
+            sig_id = (getattr(signal, 'signal_id', None) or str(signal.timestamp))
             
             # Calculate SOL amount needed using live SOL/USD
             sol_usd = await self._get_sol_usd_price()
@@ -163,6 +237,8 @@ class MemecoinExecutor:
             sol_lamports = self.wallet.sol_to_lamports(sol_amount)
             
             # Get quote from Jupiter
+            tracker.mark_quote_requested()
+            ORDERS_STARTED.inc()
             quote = await self.jupiter.get_quote(
                 input_mint=self.SOL_MINT,
                 output_mint=signal.ca,
@@ -183,6 +259,8 @@ class MemecoinExecutor:
                 if not quote:
                     logging.warning(f"❌ No quote for {signal.ca}")
                     return
+            tracker.mark_quote_received()
+            await self.idempotency.record_transition(sig_id, signal.ca, "QUOTED")
             
             # Validate quote
             is_valid, validation_msg = self.jupiter.validate_quote_for_memecoin(
@@ -204,8 +282,21 @@ class MemecoinExecutor:
                 logging.error(f"❌ Failed to get swap transaction for {signal.ca}")
                 return
             
-            # Send transaction
-            signature = await self.wallet.send_transaction(swap_transaction)
+            # Latency gating: if hot-path already > 100ms before submit, abort
+            if tracker.hot_path_ms_so_far() > 100.0:
+                ORDERS_ABORTED_LATENCY.inc()
+                logging.error(f"Latency gate abort for {signal.ca}: {tracker.hot_path_ms_so_far():.1f}ms > 100ms")
+                await self.idempotency.record_transition(sig_id, signal.ca, "FAILED")
+                return
+
+            # Sign with EphemeralSigner
+            signed_b64 = self.signer.sign_b64(swap_transaction)
+            tracker.mark_signed()
+            await self.idempotency.record_transition(sig_id, signal.ca, "SIGNED")
+            # Submit
+            # Submit via wallet
+            signature = await self.wallet.send_signed_transaction(signed_b64)
+            tracker.mark_submitted()
             
             if not signature:
                 logging.error(f"❌ Failed to send transaction for {signal.ca}")
@@ -230,6 +321,7 @@ class MemecoinExecutor:
             # Create position
             position = Position(
                 ca=signal.ca,
+                signal_id=sig_id,
                 entry_price=entry_price,
                 entry_time=time.time(),
                 size_usd=size_usd,
@@ -247,17 +339,29 @@ class MemecoinExecutor:
             # Store position
             self.positions[signal.ca] = position
             self.risk_manager.portfolio_stats.active_positions += 1
+            await self.idempotency.upsert_position(
+                signal_id=sig_id,
+                mint=signal.ca,
+                entry_signature=signature,
+                entry_time=position.entry_time,
+                size_usd=position.size_usd,
+                size_tokens=position.size_tokens,
+                token_decimals=position.token_decimals,
+                entry_price=position.entry_price,
+                status="active",
+            )
+            await self.idempotency.record_transition(sig_id, signal.ca, "CONFIRMED")
             
             logging.info(f"✅ Position opened: {signal.ca} | Size: ${size_usd:.2f} | "
                         f"Tokens: {out_amount:.0f} | Stop: ${position.stop_loss_price:.8f}")
             
             # Confirm transaction in background
-            asyncio.create_task(self._confirm_transaction(signature, position))
+            asyncio.create_task(self._confirm_transaction(signature, position, tracker))
             
         except Exception as e:
             logging.error(f"Buy execution error for {signal.ca}: {e}")
     
-    async def _confirm_transaction(self, signature: str, position: Position):
+    async def _confirm_transaction(self, signature: str, position: Position, tracker: LatencyTracker):
         """Confirm transaction and handle failures"""
         
         confirmed = await self.wallet.confirm_transaction(signature, timeout_seconds=30.0)
@@ -268,6 +372,25 @@ class MemecoinExecutor:
             if position.ca in self.positions:
                 del self.positions[position.ca]
                 self.risk_manager.portfolio_stats.active_positions -= 1
+            try:
+                await self.idempotency.upsert_position(
+                    signal_id=position.signal_id or "unknown",
+                    mint=position.ca,
+                    entry_signature=signature,
+                    entry_time=position.entry_time,
+                    size_usd=position.size_usd,
+                    size_tokens=position.size_tokens,
+                    token_decimals=position.token_decimals,
+                    entry_price=position.entry_price,
+                    status="failed",
+                )
+                await self.idempotency.record_transition(position.signal_id or "unknown", position.ca, "FAILED")
+            except Exception:
+                pass
+            ORDERS_FAILED.inc()
+        else:
+            tracker.mark_confirmed()
+            ORDERS_CONFIRMED.inc()
     
     async def _position_manager(self):
         """Monitor and manage active positions"""
@@ -322,10 +445,8 @@ class MemecoinExecutor:
             
             position.last_price_check = time.time()
             
-            # Check exit conditions
-            should_exit, exit_reason, sell_percentage = self.risk_manager.should_exit_position(
-                position, current_price
-            )
+            # Check exit conditions (staged exits 30% at 2x, 30% at 5x handled by risk_manager tiers config)
+            should_exit, exit_reason, sell_percentage = self.risk_manager.should_exit_position(position, current_price)
             
             if should_exit:
                 await self._execute_sell(position, sell_percentage, exit_reason, current_price)
@@ -419,6 +540,24 @@ class MemecoinExecutor:
                     
                     self.trade_results.append(trade_result)
                     self.risk_manager.record_trade_result(total_pnl)
+                    BOTS_TRADES_TOTAL.inc()
+                    if total_pnl > 0:
+                        BOTS_TRADES_WON.inc()
+                    try:
+                        await self.idempotency.upsert_position(
+                            signal_id=position.signal_id or "unknown",
+                            mint=position.ca,
+                            entry_signature=position.entry_signature,
+                            entry_time=position.entry_time,
+                            size_usd=position.size_usd,
+                            size_tokens=position.size_tokens,
+                            token_decimals=position.token_decimals,
+                            entry_price=position.entry_price,
+                            status="closed",
+                        )
+                        await self.idempotency.record_transition(position.signal_id or "unknown", position.ca, "CLOSED")
+                    except Exception:
+                        pass
                     
                     logging.info(f"🏁 Position closed: {position.ca} | "
                                 f"P&L: ${total_pnl:.2f} ({total_pnl/position.size_usd:.1%}) | "
@@ -430,6 +569,10 @@ class MemecoinExecutor:
                     
                     partial_pnl = sol_value_usd - (position.size_usd * sell_percentage)
                     position.realized_pnl += partial_pnl
+                    try:
+                        await self.idempotency.record_exit(position.signal_id or "unknown", position.ca, sell_percentage)
+                    except Exception:
+                        pass
                     
                     logging.info(f"💰 Partial sell: {position.ca} | "
                                 f"Sold: {sell_percentage:.1%} | "

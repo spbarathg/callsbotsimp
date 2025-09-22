@@ -9,7 +9,8 @@ import time
 from typing import Optional
 
 # Import from the executor module
-from exec.queue_bridge import FastSignalQueue, SignalProcessor
+from exec.redis_queue import RedisSignalQueue
+from exec.config import load_executor_settings
 from exec.models import SignalData
 
 
@@ -17,8 +18,16 @@ class ExecutorBridge:
     """Bridge to connect monitor signals to executor"""
     
     def __init__(self, signal_queue_path: str = "data/executor_queue.json"):
-        self.signal_queue = FastSignalQueue(signal_queue_path)
-        self.signal_processor = SignalProcessor(self.signal_queue)
+        # Require Redis Streams
+        settings = load_executor_settings()
+        if not settings.redis_url:
+            raise ValueError("REDIS_URL is required for monitor → executor bridge")
+        self.signal_queue = RedisSignalQueue(
+            settings.redis_url,
+            settings.redis_stream_key,
+            settings.redis_consumer_group,
+            consumer="monitor"
+        )
         self.enabled = True
     
     async def send_trade_intent(self, trade_intent_event) -> None:
@@ -41,8 +50,29 @@ class ExecutorBridge:
                 'rc_lp_text': trade_intent_event.rc_lp_text,
             }
             
-            # Process and queue the signal
-            await self.signal_processor.process_trade_intent(trade_intent_data)
+            # Build SignalData inline with quality scoring and enqueue
+            signal = SignalData(
+                ca=trade_intent_data['ca'],
+                timestamp=time.time(),
+                kind=trade_intent_data['kind'],
+                ug_fast=trade_intent_data['ug_fast'],
+                ug_slow=trade_intent_data['ug_slow'],
+                velocity_mpm=trade_intent_data['velocity_mpm'],
+                first_seen_ts=trade_intent_data.get('first_seen_ts'),
+                rugcheck_score=trade_intent_data['rc_score'],
+                rugcheck_risks=trade_intent_data['rc_risk_text'],
+                rugcheck_lp=trade_intent_data['rc_lp_text']
+            )
+            base_quality = 0.6
+            group_boost = min(0.2, (signal.ug_fast - 4) * 0.05)
+            velocity_boost = min(0.1, signal.velocity_mpm / 10.0)
+            age_penalty = 0.0
+            if signal.first_seen_ts:
+                age_minutes = (signal.timestamp - signal.first_seen_ts) / 60.0
+                if age_minutes > 30:
+                    age_penalty = min(0.2, (age_minutes - 30) / 60.0)
+            signal.quality_score = max(0.3, min(1.0, base_quality + group_boost + velocity_boost - age_penalty))
+            await self.signal_queue.put_signal(signal)
             
         except Exception as e:
             logging.error(f"Failed to send trade intent to executor: {e}")

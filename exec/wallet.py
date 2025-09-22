@@ -107,37 +107,20 @@ class SolanaWallet:
             return result.get('value', {}).get('blockhash')
         return None
     
-    async def send_transaction(
-        self, 
-        transaction_b64: str, 
+    async def send_signed_transaction(
+        self,
+        signed_b64: str,
         max_retries: int = 3,
         skip_preflight: bool = True
     ) -> Optional[str]:
-        """Send transaction and return signature"""
-        
+        """Submit a pre-signed transaction and return signature"""
         try:
-            # Decode and sign transaction
-            transaction_bytes = base64.b64decode(transaction_b64)
-            transaction = VersionedTransaction.from_bytes(transaction_bytes)
-            
-            # Sign transaction
-            signed_transaction = VersionedTransaction(
-                transaction.message, 
-                [self.keypair]
-            )
-            
-            # Serialize signed transaction
-            signed_bytes = bytes(signed_transaction)
-            signed_b64 = base64.b64encode(signed_bytes).decode('utf-8')
-            
             # Best-effort submit to Jito bundle endpoint (optional)
             if self.jito_bundle_url:
                 try:
                     asyncio.create_task(self._submit_jito_bundle(signed_b64))
                 except Exception:
                     pass
-            
-            # Send transaction with retries
             for attempt in range(max_retries):
                 params = [
                     signed_b64,
@@ -145,25 +128,42 @@ class SolanaWallet:
                         "skipPreflight": skip_preflight,
                         "preflightCommitment": "processed",
                         "encoding": "base64",
-                        "maxRetries": 0  # We handle retries ourselves
+                        "maxRetries": 0
                     }
                 ]
-                
                 result = await self._rpc_call("sendTransaction", params, use_backup=(attempt > 0))
-                
                 if result:
                     signature = result
                     logging.info(f"✅ Transaction sent: {signature}")
                     return signature
-                
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
-            
+                    await asyncio.sleep(0.5 * (attempt + 1))
             logging.error("❌ All transaction send attempts failed")
             return None
-            
         except Exception as e:
             logging.error(f"❌ Transaction send error: {e}")
+            return None
+
+    async def send_transaction(
+        self,
+        swap_transaction_b64: str,
+        skip_preflight: bool = True
+    ) -> Optional[str]:
+        """Sign a base64-encoded swap transaction and submit it.
+
+        This helper mirrors the buy-path flow (sign then submit) for the sell path
+        which receives an unsigned transaction from Jupiter.
+        """
+        try:
+            tx = VersionedTransaction.from_bytes(base64.b64decode(swap_transaction_b64))
+            signed = VersionedTransaction(tx.message, [self.keypair])
+            signed_b64 = base64.b64encode(bytes(signed)).decode('utf-8')
+            return await self.send_signed_transaction(
+                signed_b64,
+                skip_preflight=skip_preflight,
+            )
+        except Exception as e:
+            logging.error(f"❌ send_transaction error: {e}")
             return None
 
     async def _submit_jito_bundle(self, signed_b64: str) -> None:

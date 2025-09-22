@@ -47,8 +47,14 @@ class ExecutorSettings:
     price_check_interval_ms: int
     max_concurrent_positions: int
     
-    # Shared queue path for signals
+    # Shared queue path for legacy file signals (fallback)
     signal_queue_path: str
+    
+    # Redis queue configuration (preferred)
+    redis_url: Optional[str]
+    redis_stream_key: str
+    redis_consumer_group: str
+    redis_consumer_name: str
 
 
 def load_executor_settings() -> ExecutorSettings:
@@ -97,4 +103,10 @@ def load_executor_settings() -> ExecutorSettings:
         
         # Shared queue
         signal_queue_path=os.getenv("SIGNAL_QUEUE_PATH", "data/executor_queue.json"),
+        
+        # Redis queue
+        redis_url=os.getenv("REDIS_URL"),
+        redis_stream_key=os.getenv("REDIS_STREAM_KEY", "exec_signals"),
+        redis_consumer_group=os.getenv("REDIS_CONSUMER_GROUP", "executor"),
+        redis_consumer_name=os.getenv("REDIS_CONSUMER_NAME", "worker-1"),
     )

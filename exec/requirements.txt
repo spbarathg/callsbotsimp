@@ -11,5 +11,6 @@ solders==0.21.0
 # Base58 encoding (for private keys)
 base58==2.1.1
 
-# Optional: For Jito bundle submission
-jito-py==0.1.0
+# Messaging and metrics
+redis==5.0.8
+prometheus-client==0.20.0
